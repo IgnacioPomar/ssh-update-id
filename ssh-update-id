@@ -1,0 +1,89 @@
+#!/bin/bash
+# ssh-update-id -i ~/.ssh/mykey -o ~/.ssh/oldkey  user@host
+
+###############################################################################
+# Parse and check params
+###############################################################################
+usage()
+{
+    if [ -n "$1" ]
+    then
+        echo -e "\n$1\n"
+    fi
+    echo "Usage: $0 -i <newKey> -o <oldKey> user@host"   1>&2;
+    exit 1;
+}
+
+while getopts i:o:? opt
+do
+   case $opt in
+     i ) newKey="$OPTARG" ;;
+     o ) oldKey="$OPTARG" ;;
+     ? ) usage ;;
+  esac
+done
+shift $(( OPTIND - 1 ))
+targetHost=$@
+
+#All parameters are present
+if [ -z "$newKey" ] || [ -z "$oldKey" ] || [ -z "$targetHost" ]
+then
+   usage "Error: You must fill all the parameteres"
+fi
+
+#check sintax of targetHost
+if  [[ "$targetHost" != *"@"* ]]
+then
+   usage "Error: targetHost has bad format, you must specify user and host"
+fi
+if  [[ "$targetHost" == *" "* ]]
+then
+   usage "Error: only one targetHost is allowed"
+fi
+
+#Check the keyFiles
+if [[ ! -f $newKey ]] || [[ ! -f $oldKey ]]
+then
+    usage "Both key files must exist"
+fi
+
+
+# Generate public keys
+oldPubKey=$(ssh-keygen -y -f $oldKey 2>&1);
+if  [[ "$oldPubKey" == *"invalid format"* ]]
+then
+    echo "$oldPubKey"
+    exit 1
+fi
+newPubKey=$(ssh-keygen -y -f $newKey 2>&1);
+if  [[ "$newPubKey" == *"invalid format"* ]]
+then
+    echo "$newPubKey"
+    exit 1
+fi
+
+###############################################################################
+# Magic here
+###############################################################################
+#download the current authorized_keys for check prupouses
+oldKeysFile=$(mktemp)
+$(scp -q -i $oldKey $targetHost:~/.ssh/authorized_keys $oldKeysFile)
+
+#check if the newcert is already in the file
+if grep -q "$newPubKey" $oldKeysFile
+then
+  echo "Error: The authorized_keys contains both public keys. This must be resolved manually."
+  exit
+fi
+
+
+#Adds the new public key to the file
+ssh -i $oldKey $targetHost "echo \"$newPubKey\" >> ~/.ssh/authorized_keys"
+
+#removes the old key using the new one
+cmd="umask 077 && grep -v \"$oldPubKey\" ~/.ssh/authorized_keys > temp && mv temp ~/.ssh/authorized_keys"
+ssh -i $newKey $targetHost "$cmd"
+
+
+#cleanup
+rm $oldKeysFile
