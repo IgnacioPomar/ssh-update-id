@@ -1,89 +1,116 @@
 #!/bin/bash
-# ssh-update-id -i ~/.ssh/mykey -o ~/.ssh/oldkey  user@host
+# ssh-update-id -i ~/.ssh/mykey -o ~/.ssh/oldkey  user@host  [user2@host2 ...]
+
+# Enable strict mode for safety and robustness:
+# -e: exit immediately if a command exits with a non-zero status
+# -u: treat unset variables as an error and exit immediately
+# -o pipefail: return the exit status of the first command in a pipeline that fails
+set -euo pipefail
 
 ###############################################################################
 # Parse and check params
 ###############################################################################
-usage()
-{
-    if [ -n "$1" ]
-    then
-        echo -e "\n$1\n"
+usage() {
+    if [ -n "${1:-}" ]; then
+        printf "\n%s\n\n" "$1"
     fi
-    echo "Usage: $0 -i <newKey> -o <oldKey> user@host"   1>&2;
-    exit 1;
+    echo "Usage: $0 -i <newKey> -o <oldKey> user@host" >&2
+    exit 1
 }
 
-while getopts i:o:? opt
-do
-   case $opt in
-     i ) newKey="$OPTARG" ;;
-     o ) oldKey="$OPTARG" ;;
-     ? ) usage ;;
-  esac
+newKey=""
+oldKey=""
+
+while getopts i:o:? opt; do
+    case $opt in
+        i) newKey="$OPTARG" ;;
+        o) oldKey="$OPTARG" ;;
+        ?) usage ;;
+    esac
 done
-shift $(( OPTIND - 1 ))
-targetHost=$@
+shift $((OPTIND - 1))
 
-#All parameters are present
-if [ -z "$newKey" ] || [ -z "$oldKey" ] || [ -z "$targetHost" ]
-then
-   usage "Error: You must fill all the parameteres"
-fi
+targetHosts=("$@")
 
-#check sintax of targetHost
-if  [[ "$targetHost" != *"@"* ]]
-then
-   usage "Error: targetHost has bad format, you must specify user and host"
-fi
-if  [[ "$targetHost" == *" "* ]]
-then
-   usage "Error: only one targetHost is allowed"
+# Check parameters
+if [[ -z "$newKey" || -z "$oldKey" ]]; then
+    usage "Error: You must provide old and new keys"
 fi
 
-#Check the keyFiles
-if [[ ! -f $newKey ]] || [[ ! -f $oldKey ]]
-then
-    usage "Both key files must exist"
+# Check targetHost
+if [[ "${#targetHosts[@]}" -eq 0 ]]; then
+    usage "Error: You must provide at least one targetHost"
 fi
+
+# Check key files
+[[ -f "$newKey" ]] || usage "New key file not found: $newKey"
+[[ -f "$oldKey" ]] || usage "Old key file not found: $oldKey"
 
 
 # Generate public keys
-oldPubKey=$(ssh-keygen -y -f $oldKey 2>&1);
-if  [[ "$oldPubKey" == *"invalid format"* ]]
-then
-    echo "$oldPubKey"
-    exit 1
+oldPubKey=$(ssh-keygen -y -f "$oldKey" 2>/dev/null | cut -d' ' -f1,2) || usage "Invalid old private key"
+newPubKeyFull=$(ssh-keygen -y -f "$newKey" 2>/dev/null) || usage "Invalid new private key"
+newPubKey=$(echo "$newPubKeyFull" | cut -d' ' -f1,2)
+
+# Create temp file with new key once
+tempKeyFile=$(mktemp)
+echo "$newPubKeyFull" > "$tempKeyFile"
+
+# Check if keys are the same
+if [[ "$oldPubKey" == "$newPubKey" ]]; then
+    usage "New key and old key are identical. Aborting to prevent self-replacement."
 fi
-newPubKey=$(ssh-keygen -y -f $newKey 2>&1);
-if  [[ "$newPubKey" == *"invalid format"* ]]
-then
-    echo "$newPubKey"
-    exit 1
-fi
+
 
 ###############################################################################
-# Magic here
+# Perform update for each target host
 ###############################################################################
-#download the current authorized_keys for check prupouses
-oldKeysFile=$(mktemp)
-$(scp -q -i $oldKey $targetHost:~/.ssh/authorized_keys $oldKeysFile)
+for targetHost in "${targetHosts[@]}"; do
+    echo -e "\nUpdating keys for: $targetHost"
 
-#check if the newcert is already in the file
-if grep -q "$newPubKey" $oldKeysFile
-then
-  echo "Error: The authorized_keys contains both public keys. This must be resolved manually."
-  exit
-fi
+    # Validate targetHost format
+    if [[ "$targetHost" != *@* ]]; then
+        echo "Error: targetHost '$targetHost' must be in format user@host"
+        continue
+    fi
+
+    tmpKeysFile=$(mktemp /tmp/authorized_keys.XXXXXX)
+
+    # Copy current authorized_keys
+    scp -q -i "$oldKey" "$targetHost:~/.ssh/authorized_keys" "$tmpKeysFile" || touch "$tmpKeysFile"
+
+    # Strip comments before checking for key presence
+    cleanedKeys=$(cut -d' ' -f1,2 "$tmpKeysFile")
+
+    # Check if new key already exists (ignoring comments)
+    if grep -qF "$newPubKey" <<< "$cleanedKeys"; then
+        echo "Warning: The authorized_keys on $targetHost already contains the new key. Skipping."
+        rm -f "$tmpKeysFile"
+        continue
+    fi
+
+    # Add full new public key (including comment) using old key
+	scp -q -i "$oldKey" "$tempKeyFile" "$targetHost:~/.ssh/temp_newkey.pub"
+    ssh -i "$oldKey" "$targetHost" "umask 077 && cat ~/.ssh/temp_newkey.pub >> ~/.ssh/authorized_keys && rm ~/.ssh/temp_newkey.pub"
+	
+	
+	# Test connectivity with new key before removing the old one
+    if ssh -q -o BatchMode=yes -i "$newKey" "$targetHost" "true"; then
+        # Remove old public key using new key (ignoring comment)
+        cmd="umask 077 && grep -vF \"$oldPubKey\" ~/.ssh/authorized_keys > ~/.ssh/tmp_keys && mv ~/.ssh/tmp_keys ~/.ssh/authorized_keys"
+        ssh -i "$newKey" "$targetHost" "$cmd"
+        echo "Old key removed successfully on $targetHost"
+    else
+        echo "Error: Could not connect to $targetHost using the new key. Old key NOT removed."
+    fi
+	
+    # Clean up
+    rm -f "$tmpKeysFile"
+
+    echo "Public key updated successfully on $targetHost"
+done
+
+# Remove temp key file
+rm -f "$tempKeyFile"
 
 
-#Adds the new public key to the file
-ssh -i $oldKey $targetHost "echo \"$newPubKey\" >> ~/.ssh/authorized_keys"
-
-#removes the old key using the new one
-cmd="umask 077 && grep -v \"$oldPubKey\" ~/.ssh/authorized_keys > temp && mv temp ~/.ssh/authorized_keys"
-ssh -i $newKey $targetHost "$cmd"
-
-
-#cleanup
-rm $oldKeysFile
